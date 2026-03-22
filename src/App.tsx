@@ -76,7 +76,7 @@ function loadFromStorage<T>(key: string): T | null {
   }
 }
 
-export default function App() {
+export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide') => void }) {
   // State
   const [step, setStep] = useState(1);
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -247,7 +247,14 @@ export default function App() {
             </div>
             <span className="text-lg font-semibold text-gray-900">LegalMerge</span>
           </div>
-          <div className="text-sm text-gray-500">100% Client-Side</div>
+          <div className="flex items-center gap-4">
+            <button
+              onClick={() => onNavigate('guide')}
+              className="text-sm text-gray-500 hover:text-gray-900 transition-colors font-medium"
+            >
+              How to Use
+            </button>
+          </div>
         </div>
       </nav>
 
