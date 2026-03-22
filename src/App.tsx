@@ -605,7 +605,7 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
 
       {/* Footer */}
       <footer className="text-center py-8 text-gray-400 text-sm">
-        <p>LegalMerge &bull; 100% Client-Side &bull; Your Data Never Leaves Your Browser</p>
+        <p>LegalMerge &bull; Privacy First &bull; Your Data Never Leaves Your Browser</p>
         <p className="mt-2 text-gray-300">Created by Tarun Agarwal</p>
       </footer>
 
