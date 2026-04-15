@@ -217,6 +217,7 @@ export default function App({ onNavigate, darkMode, onToggleDarkMode }: { onNavi
   const [templateIds, setTemplateIds] = useState<string[]>([]);
   const [templateSearch, setTemplateSearch] = useState('');
   const [dataSearch, setDataSearch] = useState('');
+  const [fileNamePattern, setFileNamePattern] = useState('{{Name}}_{{Index}}');
   const isDarkMode = darkMode ?? false;
 
   // Load from localStorage on mount
@@ -234,6 +235,44 @@ export default function App({ onNavigate, darkMode, onToggleDarkMode }: { onNavi
     setTemplates(newTemplates);
     saveToStorage('legalmerge_templates', newTemplates);
   };
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        switch (e.key) {
+          case '1':
+            e.preventDefault();
+            if (templateId) setStep(1);
+            break;
+          case '2':
+            e.preventDefault();
+            if (templateId && dataFileId) setStep(2);
+            break;
+          case '3':
+            e.preventDefault();
+            if (templateId && dataFileId) setStep(3);
+            break;
+          case 'g':
+            e.preventDefault();
+            onNavigate('guide');
+            break;
+          case 'd':
+            e.preventDefault();
+            onToggleDarkMode?.();
+            break;
+          case 'Enter':
+            e.preventDefault();
+            if (templateId && dataFileId && step === 3) {
+              handleGenerate();
+            }
+            break;
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [templateId, dataFileId, step, onNavigate, onToggleDarkMode]);
 
   // Save data files to localStorage
   const saveDataFiles = (newDataFiles: DataFile[]) => {
@@ -425,13 +464,21 @@ export default function App({ onNavigate, darkMode, onToggleDarkMode }: { onNavi
         content = content.replace(regex, value);
       }
 
-      // Generate filename
-      const nameField = Object.keys(row).find(k =>
-        k.toLowerCase().includes('name') || k.toLowerCase().includes('client')
-      );
-      const fileName = nameField && row[nameField]
-        ? `${row[nameField].replace(/[^a-zA-Z0-9]/g, '_')}_${i + 1}.docx`
-        : `Document_${i + 1}.docx`;
+      // Generate filename using custom pattern
+      let fileName = fileNamePattern
+        .replace(/\{\{Index\}\}/g, String(i + 1))
+        .replace(/\{\{RowNum\}\}/g, String(i + 1));
+      
+      for (const [key, value] of Object.entries(row)) {
+        const regex = new RegExp(`\\{\\{${key.trim()}\\}\\}`, 'gi');
+        fileName = fileName.replace(regex, value.replace(/[^a-zA-Z0-9]/g, '_'));
+      }
+      
+      if (!fileName.includes('.docx')) {
+        fileName = (fileName || 'Document') + '.docx';
+      } else {
+        fileName = fileName.replace(/\.docx$/, '') + '.docx';
+      }
 
       const previewText = Object.entries(row).map(([k, v]) => `${k}: ${v}`).join(' | ');
 
@@ -505,17 +552,17 @@ export default function App({ onNavigate, darkMode, onToggleDarkMode }: { onNavi
       </nav>
 
       {/* Hero */}
-      <div className="max-w-5xl mx-auto px-6 pt-16 pb-8">
-        <h1 className="text-4xl font-semibold text-gray-900 text-center mb-3">
+      <div className="max-w-5xl mx-auto px-4 sm:px-6 pt-12 sm:pt-16 pb-8">
+        <h1 className="text-2xl sm:text-3xl lg:text-4xl font-semibold text-gray-900 text-center mb-3">
           Generate documents with<br /><span className="text-gray-400">effortless precision</span>
         </h1>
-        <p className="text-lg text-gray-500 text-center max-w-2xl mx-auto">
+        <p className="text-sm sm:text-lg text-gray-500 text-center max-w-2xl mx-auto">
           Transform your Word templates and Excel data into polished, personalized documents in seconds.
         </p>
       </div>
 
       {/* Progress */}
-      <div className="max-w-2xl mx-auto px-6 mb-12">
+      <div className="max-w-2xl mx-auto px-4 sm:px-6 mb-8 sm:mb-12">
         <div className="flex items-center justify-between">
           {[1, 2, 3, 4].map((s) => (
             <div key={s} className="flex items-center">
@@ -864,6 +911,31 @@ export default function App({ onNavigate, darkMode, onToggleDarkMode }: { onNavi
                 </div>
               </div>
 
+              <div className="bg-white rounded-2xl p-4 mb-6">
+                <p className="text-sm text-gray-500 mb-2">Output filename pattern</p>
+                <input
+                  type="text"
+                  value={fileNamePattern}
+                  onChange={(e) => setFileNamePattern(e.target.value)}
+                  placeholder="{{Name}}_{{Index}}"
+                  className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-gray-900/20 focus:border-gray-900 transition-all"
+                />
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {['{{Name}}', '{{ClientName}}', '{{CaseNumber}}', '{{Index}}', '{{RowNum}}'].map((tag) => (
+                    <button
+                      key={tag}
+                      onClick={() => setFileNamePattern(fileNamePattern + tag)}
+                      className="text-xs px-2 py-1 bg-gray-100 hover:bg-gray-200 rounded-full text-gray-600 transition-colors"
+                    >
+                      {tag}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-xs text-gray-400 mt-2">
+                  Use {'{{ColumnName}}'} to include data fields. {'{{Index}}'} or {'{{RowNum}}'} adds a number.
+                </p>
+              </div>
+
               {validation && (
                 <div className="bg-gray-50 rounded-2xl p-4 mb-6">
                   <p className="text-sm font-medium text-gray-900 mb-3">Validation Results</p>
@@ -988,6 +1060,11 @@ export default function App({ onNavigate, darkMode, onToggleDarkMode }: { onNavi
 
       {/* Footer */}
       <footer className="text-center py-8 text-gray-400 text-sm">
+        <div className="flex justify-center gap-4 mb-2 text-xs">
+          <span className="px-2 py-1 bg-gray-100 rounded">Ctrl+1/2/3</span>
+          <span className="px-2 py-1 bg-gray-100 rounded">Ctrl+G</span>
+          <span className="px-2 py-1 bg-gray-100 rounded">Ctrl+D</span>
+        </div>
         <p>LegalMerge &bull; Privacy First &bull; Your Data Never Leaves Your Browser</p>
         <p className="mt-2 text-gray-300">Created by Tarun Agarwal</p>
       </footer>
