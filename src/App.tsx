@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import JSZip from 'jszip';
 
 // Types
@@ -9,6 +9,12 @@ interface Template {
   content: string;
   placeholderNames: string[];
   createdAt: number;
+}
+
+interface ValidationResult {
+  matched: string[];
+  unmatched: string[];
+  extra: string[];
 }
 
 interface DataFile {
@@ -76,7 +82,118 @@ function loadFromStorage<T>(key: string): T | null {
   }
 }
 
-export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide') => void }) {
+function extractTextFromDocx(base64: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const bytes = atob(base64);
+    const nums = new Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) nums[i] = bytes.charCodeAt(i);
+    const array = new Uint8Array(nums);
+    const blob = new Blob([array], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        const zip = await JSZip.loadAsync(reader.result as unknown as Blob);
+        const documentXml = await zip.file('word/document.xml')?.async('string');
+        if (!documentXml) {
+          resolve('');
+          return;
+        }
+        const textMatches = documentXml.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) || [];
+        const text = textMatches
+          .map(match => match.replace(/<[^>]*>/g, ''))
+          .join(' ');
+        resolve(text);
+      } catch {
+        resolve('');
+      }
+    };
+    reader.onerror = reject;
+    reader.readAsArrayBuffer(blob);
+  });
+}
+
+async function detectPlaceholders(base64: string): Promise<string[]> {
+  try {
+    const text = await extractTextFromDocx(base64);
+    const matches = text.match(/\{\{([^}]+)\}\}/g) || [];
+    const placeholders = [...new Set(matches.map(m => m.replace(/[{}]/g, '').trim()))];
+    return placeholders;
+  } catch {
+    return [];
+  }
+}
+
+function validatePlaceholders(templatePlaceholders: string[], csvColumns: string[]): ValidationResult {
+  const templateLower = templatePlaceholders.map(p => p.toLowerCase());
+  const csvLower = csvColumns.map(c => c.toLowerCase());
+  const matched: string[] = [];
+  const unmatched: string[] = [];
+  for (const ph of templatePlaceholders) {
+    if (csvLower.includes(ph.toLowerCase())) {
+      matched.push(ph);
+    } else {
+      unmatched.push(ph);
+    }
+  }
+  const extra = csvColumns.filter(c => !templateLower.includes(c.toLowerCase()));
+  return { matched, unmatched, extra };
+}
+
+function parseXLSX(file: File): Promise<{ columns: string[]; rows: Record<string, string>[] }> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        const data = new Uint8Array(reader.result as ArrayBuffer);
+        const zip = await JSZip.loadAsync(data);
+        const sheetXml = await zip.file('xl/worksheets/sheet1.xml')?.async('string');
+        if (!sheetXml) {
+          reject(new Error('No sheet found'));
+          return;
+        }
+        const rowMatches = sheetXml.match(/<row[^>]*>(.*?)<\/row>/g) || [];
+        if (rowMatches.length < 2) {
+          resolve({ columns: [], rows: [] });
+          return;
+        }
+        const headerRow = rowMatches[0];
+        if (!headerRow) {
+          resolve({ columns: [], rows: [] });
+          return;
+        }
+        const headerMatch = headerRow.match(/<c[^>]*>(<v>[^<]*<\/v>)?/g) || [];
+        const columns: string[] = [];
+        for (const h of headerMatch) {
+          const vMatch = h.match(/<v>([^<]+)<\/v>/);
+          if (vMatch) {
+            columns.push(vMatch[1]);
+          }
+        }
+        const rows: Record<string, string>[] = [];
+        for (let i = 1; i < rowMatches.length; i++) {
+          const cellMatches = rowMatches[i].match(/<c[^>]*>(<v>[^<]*<\/v>)?/g) || [];
+          const row: Record<string, string> = {};
+          cellMatches.forEach((c, j) => {
+            const vMatch = c.match(/<v>([^<]+)<\/v>/);
+            if (vMatch && columns[j]) {
+              row[columns[j]] = vMatch[1];
+            }
+          });
+          if (Object.keys(row).length > 0) {
+            rows.push(row);
+          }
+        }
+        resolve({ columns, rows });
+      } catch {
+        reject(new Error('Failed to parse XLSX'));
+      }
+    };
+    reader.onerror = reject;
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+export default function App({ onNavigate, darkMode, onToggleDarkMode }: { onNavigate: (page: 'home' | 'guide') => void; darkMode?: boolean; onToggleDarkMode?: () => void }) {
   // State
   const [step, setStep] = useState(1);
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -89,6 +206,18 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
   const [parsedData, setParsedData] = useState<{ columns: string[]; rows: Record<string, string>[] } | null>(null);
   const [placeholders, setPlaceholders] = useState('');
   const [isDownloading, setIsDownloading] = useState(false);
+  const [detectedPlaceholders, setDetectedPlaceholders] = useState<string[]>([]);
+  const [isDetecting, setIsDetecting] = useState(false);
+  const [templateDragging, setTemplateDragging] = useState(false);
+  const [dataDragging, setDataDragging] = useState(false);
+  const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
+  const [editName, setEditName] = useState('');
+  const [editPlaceholders, setEditPlaceholders] = useState('');
+  const [validation, setValidation] = useState<ValidationResult | null>(null);
+  const [templateIds, setTemplateIds] = useState<string[]>([]);
+  const [templateSearch, setTemplateSearch] = useState('');
+  const [dataSearch, setDataSearch] = useState('');
+  const isDarkMode = darkMode ?? false;
 
   // Load from localStorage on mount
   useEffect(() => {
@@ -97,6 +226,8 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
     if (savedTemplates) setTemplates(savedTemplates);
     if (savedDataFiles) setDataFiles(savedDataFiles);
   }, []);
+
+  
 
   // Save templates to localStorage
   const saveTemplates = (newTemplates: Template[]) => {
@@ -113,8 +244,72 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
   // Handlers
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
-    if (f) { setFile(f); setTemplateName(f.name.replace(/\.[^/.]+$/, '')); }
+    if (f) {
+      setFile(f);
+      setTemplateName(f.name.replace(/\.[^/.]+$/, ''));
+      setIsDetecting(true);
+      const base64 = await fileToBase64(f);
+      const detected = await detectPlaceholders(base64);
+      setDetectedPlaceholders(detected);
+      if (detected.length > 0) {
+        setPlaceholders(detected.join(', '));
+      }
+      setIsDetecting(false);
+    }
   };
+
+  const handleTemplateDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault();
+    setTemplateDragging(false);
+    const f = e.dataTransfer.files[0];
+    if (!f || !f.name.endsWith('.docx')) return;
+    setFile(f);
+    setTemplateName(f.name.replace(/\.[^/.]+$/, ''));
+    setIsDetecting(true);
+    const base64 = await fileToBase64(f);
+    const detected = await detectPlaceholders(base64);
+    setDetectedPlaceholders(detected);
+    if (detected.length > 0) {
+      setPlaceholders(detected.join(', '));
+    }
+    setIsDetecting(false);
+  }, []);
+
+  const handleDataDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault();
+    setDataDragging(false);
+    const f = e.dataTransfer.files[0];
+    if (!f) return;
+    
+    if (f.name.endsWith('.xlsx')) {
+      try {
+        const parsed = await parseXLSX(f);
+        setParsedData(parsed);
+      } catch {
+        console.error('Failed to parse XLSX');
+      }
+    } else {
+      const reader = new FileReader();
+      reader.onload = (ev) => parseCSV(ev.target?.result as string);
+      reader.readAsText(f);
+    }
+  }, []);
+
+  const handleDragEnter = useCallback((e: React.DragEvent, type: 'template' | 'data') => {
+    e.preventDefault();
+    if (type === 'template') setTemplateDragging(true);
+    else setDataDragging(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent, type: 'template' | 'data') => {
+    e.preventDefault();
+    if (type === 'template') setTemplateDragging(false);
+    else setDataDragging(false);
+  }, []);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+  }, []);
 
   const handleSaveTemplate = async () => {
     if (!templateName.trim() || !file) return;
@@ -132,6 +327,29 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
     setFile(null);
     setTemplateName('');
     setPlaceholders('');
+    setDetectedPlaceholders([]);
+  };
+
+  const handleEditTemplate = (id: string) => {
+    const template = templates.find(t => t.id === id);
+    if (!template) return;
+    setEditingTemplateId(id);
+    setEditName(template.name);
+    setEditPlaceholders(template.placeholderNames.join(', '));
+  };
+
+  const handleSaveEdit = () => {
+    if (!editingTemplateId || !editName.trim()) return;
+    const newPlaceholdersList = editPlaceholders.split(',').map(p => p.trim()).filter(p => p);
+    const newTemplates = templates.map(t => 
+      t.id === editingTemplateId 
+        ? { ...t, name: editName, placeholderNames: newPlaceholdersList }
+        : t
+    );
+    saveTemplates(newTemplates);
+    setEditingTemplateId(null);
+    setEditName('');
+    setEditPlaceholders('');
   };
 
   const handleDeleteTemplate = (id: string) => {
@@ -154,12 +372,22 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
     setParsedData({ columns: cols, rows });
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     if (!f) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => parseCSV(ev.target?.result as string);
-    reader.readAsText(f);
+    
+    if (f.name.endsWith('.xlsx')) {
+      try {
+        const parsed = await parseXLSX(f);
+        setParsedData(parsed);
+      } catch {
+        console.error('Failed to parse XLSX');
+      }
+    } else {
+      const reader = new FileReader();
+      reader.onload = (ev) => parseCSV(ev.target?.result as string);
+      reader.readAsText(f);
+    }
   };
 
   const handleSaveData = () => {
@@ -184,6 +412,9 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
     const template = templates.find(t => t.id === templateId);
     const dataFile = dataFiles.find(f => f.id === dataFileId);
     if (!template || !dataFile) return;
+
+    const validationResult = validatePlaceholders(template.placeholderNames, dataFile.columns);
+    setValidation(validationResult);
 
     const generated: GeneratedDoc[] = dataFile.rows.map((row, i) => {
       let content = template.content;
@@ -249,6 +480,21 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
           </div>
           <div className="flex items-center gap-4">
             <button
+              onClick={onToggleDarkMode}
+              className="p-2 rounded-xl hover:bg-gray-100 transition-colors"
+              title={isDarkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+            >
+              {isDarkMode ? (
+                <svg className="w-5 h-5 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+                </svg>
+              ) : (
+                <svg className="w-5 h-5 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+                </svg>
+              )}
+            </button>
+            <button
               onClick={() => onNavigate('guide')}
               className="text-sm text-gray-500 hover:text-gray-900 transition-colors font-medium"
             >
@@ -275,7 +521,10 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
             <div key={s} className="flex items-center">
               <button
                 onClick={() => {
-                  if (s < step || (s === 2 && templateId) || (s === 3 && templateId && dataFileId)) setStep(s);
+                  if (s < step || (s === 2 && templateId) || (s === 3 && templateId && dataFileId)) {
+                    setStep(s);
+                    if (s === 1) setValidation(null);
+                  }
                 }}
                 className={`w-10 h-10 rounded-2xl flex items-center justify-center text-sm font-medium transition-all duration-300 ${
                   step === s ? 'bg-gray-900 text-white shadow-xl scale-110' :
@@ -311,7 +560,17 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
 
               <div className="grid md:grid-cols-2 gap-8">
                 <div className="space-y-4">
-                  <div className="border-2 border-dashed border-gray-200 rounded-2xl p-8 text-center transition-all duration-300 hover:border-gray-400 hover:bg-gray-50">
+                  <div 
+                    className={`border-2 border-dashed rounded-2xl p-8 text-center transition-all duration-300 ${
+                      templateDragging 
+                        ? 'border-gray-900 bg-gray-50 scale-105' 
+                        : 'border-gray-200 hover:border-gray-400 hover:bg-gray-50'
+                    }`}
+                    onDragOver={handleDragOver}
+                    onDragEnter={(e) => handleDragEnter(e, 'template')}
+                    onDragLeave={(e) => handleDragLeave(e, 'template')}
+                    onDrop={handleTemplateDrop}
+                  >
                     <input type="file" accept=".docx" onChange={handleFileSelect} className="hidden" id="docx" />
                     <label htmlFor="docx" className="cursor-pointer">
                       <div className="w-16 h-16 bg-gray-100 rounded-2xl flex items-center justify-center mx-auto mb-4">
@@ -319,13 +578,22 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 4v16m8-8H4" />
                         </svg>
                       </div>
-                      <p className="font-medium text-gray-700">{file ? file.name : 'Click to upload'}</p>
+                      <p className="font-medium text-gray-700">{file ? file.name : 'Click or drag to upload'}</p>
                       <p className="text-sm text-gray-400 mt-1">.docx files supported</p>
                     </label>
                   </div>
 
                   {file && (
                     <div className="bg-gray-50 rounded-2xl p-6 space-y-4 animate-slideUp">
+                      <div className="flex items-center justify-between">
+                        <p className="font-medium text-gray-700 truncate">{file.name}</p>
+                        <button
+                          onClick={() => { setFile(null); setTemplateName(''); setPlaceholders(''); setDetectedPlaceholders([]); }}
+                          className="text-sm text-gray-400 hover:text-red-500"
+                        >
+                          Clear
+                        </button>
+                      </div>
                       <input
                         type="text"
                         value={templateName}
@@ -333,13 +601,23 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
                         placeholder="Template name"
                         className="w-full px-4 py-3 bg-white border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-gray-900/20 focus:border-gray-900 transition-all"
                       />
-                      <input
-                        type="text"
-                        value={placeholders}
-                        onChange={(e) => setPlaceholders(e.target.value)}
-                        placeholder="Placeholders: name, address, date"
-                        className="w-full px-4 py-3 bg-white border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-gray-900/20 focus:border-gray-900 transition-all"
-                      />
+                      <div>
+                        <input
+                          type="text"
+                          value={placeholders}
+                          onChange={(e) => setPlaceholders(e.target.value)}
+                          placeholder="Placeholders: name, address, date"
+                          className="w-full px-4 py-3 bg-white border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-gray-900/20 focus:border-gray-900 transition-all"
+                        />
+                        {detectedPlaceholders.length > 0 && (
+                          <p className="text-xs text-emerald-600 mt-2 flex items-center gap-1">
+                            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                            </svg>
+                            {isDetecting ? 'Detecting...' : `${detectedPlaceholders.length} placeholders auto-detected`}
+                          </p>
+                        )}
+                      </div>
                       <p className="text-xs text-gray-400">Use {'{{placeholder}}'} in your document</p>
                       <button
                         onClick={handleSaveTemplate}
@@ -352,7 +630,7 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
                   )}
                 </div>
 
-                <div>
+<div>
                   <h3 className="font-medium text-gray-900 mb-4">Saved Templates</h3>
                   {templates.length === 0 ? (
                     <div className="text-center py-12 text-gray-400 bg-gray-50 rounded-2xl">
@@ -379,18 +657,65 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
                                 {t.placeholderNames.join(', ') || 'No placeholders'}
                               </p>
                             </div>
-                            <button
-                              onClick={(e) => { e.stopPropagation(); handleDeleteTemplate(t.id); }}
-                              className={`text-sm ${templateId === t.id ? 'text-gray-500 hover:text-gray-300' : 'text-gray-400 hover:text-red-500'}`}
-                            >
-                              Delete
-                            </button>
+                            <div className="flex gap-2">
+                              <button
+                                onClick={(e) => { e.stopPropagation(); handleEditTemplate(t.id); }}
+                                className={`text-sm ${templateId === t.id ? 'text-gray-500 hover:text-gray-300' : 'text-gray-400 hover:text-blue-500'}`}
+                              >
+                                Edit
+                              </button>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); handleDeleteTemplate(t.id); }}
+                                className={`text-sm ${templateId === t.id ? 'text-gray-500 hover:text-gray-300' : 'text-gray-400 hover:text-red-500'}`}
+                              >
+                                Delete
+                              </button>
+                            </div>
                           </div>
                         </div>
                       ))}
                     </div>
                   )}
                 </div>
+
+                {editingTemplateId && (
+                  <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+                    <div className="bg-white rounded-3xl p-6 w-full max-w-md animate-slideUp">
+                      <h3 className="text-xl font-semibold text-gray-900 mb-4">Edit Template</h3>
+                      <div className="space-y-4">
+                        <input
+                          type="text"
+                          value={editName}
+                          onChange={(e) => setEditName(e.target.value)}
+                          placeholder="Template name"
+                          className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-gray-900/20 focus:border-gray-900 transition-all"
+                        />
+                        <input
+                          type="text"
+                          value={editPlaceholders}
+                          onChange={(e) => setEditPlaceholders(e.target.value)}
+                          placeholder="Placeholders: name, address, date"
+                          className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-gray-900/20 focus:border-gray-900 transition-all"
+                        />
+                        <div className="flex gap-3">
+                          <button
+                            onClick={() => setEditingTemplateId(null)}
+                            className="flex-1 py-3 bg-gray-100 text-gray-700 rounded-xl font-medium hover:bg-gray-200 transition-all"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            onClick={handleSaveEdit}
+                            disabled={!editName.trim()}
+                            className="flex-1 py-3 bg-gray-900 text-white rounded-xl font-medium hover:bg-gray-800 disabled:opacity-50 transition-all"
+                          >
+                            Save Changes
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {templateId && (
@@ -416,16 +741,26 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
 
               <div className="grid md:grid-cols-2 gap-8">
                 <div className="space-y-4">
-                  <div className="border-2 border-dashed border-gray-200 rounded-2xl p-8 text-center transition-all duration-300 hover:border-gray-400 hover:bg-gray-50">
-                    <input type="file" accept=".csv,.tsv,.txt" onChange={handleFileUpload} className="hidden" id="csv" />
+                  <div 
+                    className={`border-2 border-dashed rounded-2xl p-8 text-center transition-all duration-300 ${
+                      dataDragging 
+                        ? 'border-gray-900 bg-gray-50 scale-105' 
+                        : 'border-gray-200 hover:border-gray-400 hover:bg-gray-50'
+                    }`}
+                    onDragOver={handleDragOver}
+                    onDragEnter={(e) => handleDragEnter(e, 'data')}
+                    onDragLeave={(e) => handleDragLeave(e, 'data')}
+                    onDrop={handleDataDrop}
+                  >
+                    <input type="file" accept=".csv,.tsv,.txt,.xlsx" onChange={handleFileUpload} className="hidden" id="csv" />
                     <label htmlFor="csv" className="cursor-pointer">
                       <div className="w-16 h-16 bg-gray-100 rounded-2xl flex items-center justify-center mx-auto mb-4">
                         <svg className="w-8 h-8 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                         </svg>
                       </div>
-                      <p className="font-medium text-gray-700">Upload CSV/TSV</p>
-                      <p className="text-sm text-gray-400 mt-1">or paste data below</p>
+                      <p className="font-medium text-gray-700">Click or drag to upload</p>
+                      <p className="text-sm text-gray-400 mt-1">.csv, .tsv, .txt, .xlsx supported</p>
                     </label>
                   </div>
 
@@ -529,9 +864,57 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
                 </div>
               </div>
 
-              <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 mb-6">
-                <p className="text-amber-800 text-sm">Make sure your CSV columns match the placeholders in your template</p>
-              </div>
+              {validation && (
+                <div className="bg-gray-50 rounded-2xl p-4 mb-6">
+                  <p className="text-sm font-medium text-gray-900 mb-3">Validation Results</p>
+                  {validation.matched.length > 0 && (
+                    <div className="flex flex-wrap gap-2 mb-2">
+                      {validation.matched.map((m) => (
+                        <span key={m} className="px-2 py-1 bg-emerald-100 text-emerald-700 rounded-full text-xs flex items-center gap-1">
+                          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                          </svg>
+                          {m}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {validation.unmatched.length > 0 && (
+                    <div className="mb-2">
+                      <p className="text-xs text-red-600 mb-1">Unmatched placeholders (will remain unchanged):</p>
+                      <div className="flex flex-wrap gap-2">
+                        {validation.unmatched.map((u) => (
+                          <span key={u} className="px-2 py-1 bg-red-100 text-red-700 rounded-full text-xs">{u}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {validation.extra.length > 0 && (
+                    <div>
+                      <p className="text-xs text-amber-600 mb-1">Extra columns (not in template):</p>
+                      <div className="flex flex-wrap gap-2">
+                        {validation.extra.map((e) => (
+                          <span key={e} className="px-2 py-1 bg-amber-100 text-amber-700 rounded-full text-xs">{e}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {validation.unmatched.length === 0 && validation.extra.length === 0 && (
+                    <p className="text-emerald-600 text-sm flex items-center gap-1">
+                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                      </svg>
+                      All placeholders matched!
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {!validation && (
+                <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 mb-6">
+                  <p className="text-amber-800 text-sm">Make sure your CSV columns match the placeholders in your template</p>
+                </div>
+              )}
 
               <button
                 onClick={handleGenerate}
@@ -593,7 +976,7 @@ export default function App({ onNavigate }: { onNavigate: (page: 'home' | 'guide
               </div>
 
               <button
-                onClick={() => { setStep(1); setTemplateId(null); setDataFileId(null); setDocs([]); }}
+                onClick={() => { setStep(1); setTemplateId(null); setDataFileId(null); setDocs([]); setValidation(null); }}
                 className="mt-8 w-full py-4 bg-gray-100 text-gray-700 rounded-2xl font-medium hover:bg-gray-200 transition-all"
               >
                 Start Over
