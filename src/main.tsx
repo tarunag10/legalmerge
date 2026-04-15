@@ -11,8 +11,12 @@ function Root() {
   });
 
   useEffect(() => {
-    document.documentElement.classList.toggle('dark', darkMode);
     localStorage.setItem('legalmerge_darkmode', String(darkMode));
+    if (darkMode) {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
   }, [darkMode]);
 
   const navigate = (p: 'home' | 'guide') => {

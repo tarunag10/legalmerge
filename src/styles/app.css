@@ -1,9 +1,63 @@
 @import 'tailwindcss';
 
+@theme {
+  --color-primary: #374151;
+}
+
 @layer base {
   html,
   body {
-    @apply text-gray-900 bg-gray-50 dark:bg-gray-950 dark:text-gray-200;
+    @apply text-gray-900 bg-gray-50;
+    color-scheme: light dark;
+  }
+
+  html.dark,
+  html.dark body {
+    @apply bg-gray-900 text-gray-100;
+  }
+
+  html.dark .bg-white {
+    @apply bg-gray-800;
+  }
+
+  html.dark .bg-gray-50 {
+    @apply bg-gray-800;
+  }
+
+  html.dark .bg-gray-100 {
+    @apply bg-gray-700;
+  }
+
+  html.dark .text-gray-900 {
+    @apply text-white;
+  }
+
+  html.dark .text-gray-700 {
+    @apply text-gray-200;
+  }
+
+  html.dark .text-gray-500 {
+    @apply text-gray-400;
+  }
+
+  html.dark .text-gray-400 {
+    @apply text-gray-500;
+  }
+
+  html.dark .border-gray-200 {
+    @apply border-gray-700;
+  }
+
+  html.dark .border-gray-300 {
+    @apply border-gray-600;
+  }
+
+  html.dark .bg-gray-900 {
+    @apply bg-gray-100;
+  }
+
+  html.dark .shadow-lg {
+    @apply shadow-xl;
   }
 
   .using-mouse * {
